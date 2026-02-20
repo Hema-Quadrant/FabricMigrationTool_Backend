@@ -6,6 +6,10 @@ import uuid
 import logging
 import requests
 from collections import defaultdict
+from dotenv import load_dotenv
+from pathlib import Path
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from .migrate_notebooks import get_fabric_token
 from .connect_databricks import get_job, export_notebook
@@ -79,8 +83,9 @@ def poll_lro(location: str, token: str, refresh_fn, max_sec: int = 1200) -> dict
     raise TimeoutError(f"LRO timed out after {max_sec}s")
 
 
-def create_fabric_notebook(workspace_id: str, token: str, name: str, content_b64: str, refresh_fn) -> str:
+def create_fabric_notebook(workspace_id: str, token: str, name: str, content_b64: str, refresh_fn, run_id: str) -> str:
     name = sanitize_name(name)
+    logging.info(f"[RUN:{run_id}] Creating notebook in Fabric: {name}")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "displayName": name, "type": "Notebook",
@@ -97,17 +102,22 @@ def create_fabric_notebook(workspace_id: str, token: str, name: str, content_b64
                 item_id = poll_lro(r.headers["Location"], token, refresh_fn).get("id")
             else:
                 r.raise_for_status()
+            logging.info(f"[RUN:{run_id}] Notebook created: {name} (ID: {item_id}), waiting until ready...")
             if wait_until_ready(workspace_id, token, item_id):
+                logging.info(f"[RUN:{run_id}] Notebook ready: {name}")
                 return item_id
             raise RuntimeError(f"Notebook not ready: {item_id}")
         except Exception as e:
+            logging.warning(f"[RUN:{run_id}] Notebook create attempt {attempt} failed: {str(e)}")
             if attempt == 3:
                 raise
             time.sleep(10 * attempt)
     raise RuntimeError("Failed after 3 attempts")
 
 
-def create_fabric_pipeline(workspace_id: str, token: str, payload: dict, refresh_fn) -> str:
+def create_fabric_pipeline(workspace_id: str, token: str, payload: dict, refresh_fn, run_id: str) -> str:
+    pipeline_name = payload.get("displayName", "unknown")
+    logging.info(f"[RUN:{run_id}] Creating pipeline: {pipeline_name}")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items"
     for attempt in range(1, 4):
@@ -115,14 +125,18 @@ def create_fabric_pipeline(workspace_id: str, token: str, payload: dict, refresh
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=180)
             if r.status_code in (200, 201):
-                return r.json()["id"]
+                pid = r.json()["id"]
+                logging.info(f"[RUN:{run_id}] Pipeline created: {pipeline_name} (ID: {pid})")
+                return pid
             if r.status_code == 202:
                 item_id = poll_lro(r.headers["Location"], token, refresh_fn).get("id")
                 if item_id:
+                    logging.info(f"[RUN:{run_id}] Pipeline created via LRO: {pipeline_name} (ID: {item_id})")
                     return item_id
                 raise ValueError("Pipeline LRO missing id")
             r.raise_for_status()
         except Exception as e:
+            logging.warning(f"[RUN:{run_id}] Pipeline create attempt {attempt} failed: {str(e)}")
             if attempt == 3:
                 raise
             time.sleep(12 * attempt)
@@ -144,7 +158,6 @@ def get_existing_pipeline_id(workspace_id: str, token: str, name: str) -> str | 
 # ─── Condition / expression helpers ────────────────────────
 
 def get_adf_operand(operand) -> str:
-    # Handle non-string values (lists, ints, bools, etc.)
     if operand is None:
         return "''"
     if isinstance(operand, bool):
@@ -271,7 +284,7 @@ def collect_notebooks(tasks: list, nbs: set):
                 collect_notebooks([task["switch_task"]["default"]], nbs)
 
 
-def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id, ignore=None) -> list:
+def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id, ignore=None, run_id="") -> list:
     ignore = ignore or set()
     acts = []
     for key in keys:
@@ -282,6 +295,7 @@ def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id,
         if not task:
             continue
         deps = get_depends_on(task.get("depends_on", []), ignore)
+        logging.info(f"[RUN:{run_id}] Building activity: {key} (type: {'condition' if 'condition_task' in task else 'notebook' if 'notebook_task' in task else 'foreach' if 'for_each_task' in task else 'switch' if 'switch_task' in task else 'unknown'})")
 
         if "condition_task" in task or "condition" in task:
             expr = get_condition_expression(task["condition_task"]) if "condition_task" in task else translate_condition(task.get("condition", "true"))
@@ -297,19 +311,21 @@ def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id,
                 if ("true" in b and "false" in b) or not b: shared_keys.append(tk)
                 elif "true" in b: true_keys.append(tk)
                 else: false_keys.append(tk)
+            logging.info(f"[RUN:{run_id}] IfCondition '{key}': true={true_keys}, false={false_keys}, shared={shared_keys}")
             acts.append({
                 "name": key, "type": "IfCondition", "dependsOn": deps,
                 "typeProperties": {
                     "expression": {"value": expr, "type": "Expression"},
-                    "ifTrueActivities": build_activities(true_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore | {key}),
-                    "ifFalseActivities": build_activities(false_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore | {key})
+                    "ifTrueActivities": build_activities(true_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore | {key}, run_id),
+                    "ifFalseActivities": build_activities(false_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore | {key}, run_id)
                 }
             })
-            acts.extend(build_activities(shared_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore))
+            acts.extend(build_activities(shared_keys, visited.copy(), task_dict, successors, nb_map, workspace_id, ignore, run_id))
 
         elif "notebook_task" in task:
             nb_id = nb_map.get(task["notebook_task"]["notebook_path"])
             if not nb_id:
+                logging.warning(f"[RUN:{run_id}] No Fabric notebook ID found for path: {task['notebook_task']['notebook_path']} — skipping activity '{key}'")
                 continue
             params = {}
             for k, v in task["notebook_task"].get("base_parameters", {}).items():
@@ -318,14 +334,15 @@ def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id,
             act = {"name": key, "type": "TridentNotebook", "dependsOn": deps, "policy": {"timeout": "1.00:00:00", "retry": 1, "retryIntervalInSeconds": 30}, "typeProperties": {"notebookId": nb_id, "workspaceId": workspace_id}}
             if params:
                 act["typeProperties"]["parameters"] = params
+            logging.info(f"[RUN:{run_id}] Notebook activity '{key}' built with {len(params)} parameter(s)")
             acts.append(act)
-            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore)
+            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore, run_id)
 
         elif "for_each_task" in task:
             inputs_expr = translate_condition(task["for_each_task"].get("inputs", "[]")).lstrip("@")
             nested = task["for_each_task"].get("task", {})
             nk = nested.get("task_key", f"{key}_inner")
-            inner_acts = build_activities([nk], visited.copy(), {nk: nested}, successors, nb_map, workspace_id, ignore | {key})
+            inner_acts = build_activities([nk], visited.copy(), {nk: nested}, successors, nb_map, workspace_id, ignore | {key}, run_id)
             for ia in inner_acts:
                 for p in ia.get("typeProperties", {}).get("parameters", {}).values():
                     if isinstance(p.get("value"), str) and "{{input}}" in p["value"]:
@@ -335,8 +352,9 @@ def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id,
             act = {"name": key, "type": "ForEach", "dependsOn": deps, "typeProperties": {"items": {"value": f"@{inputs_expr}", "type": "Expression"}, "isSequential": concurrency <= 1, "activities": inner_acts}}
             if concurrency > 1:
                 act["typeProperties"]["batchCount"] = min(concurrency, 50)
+            logging.info(f"[RUN:{run_id}] ForEach activity '{key}' built with {len(inner_acts)} inner activity(s)")
             acts.append(act)
-            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore)
+            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore, run_id)
 
         elif "switch_task" in task:
             switch_val = translate_condition(task["switch_task"].get("expression", "@true")).lstrip("@")
@@ -344,18 +362,19 @@ def build_activities(keys, visited, task_dict, successors, nb_map, workspace_id,
             for ci in task["switch_task"].get("cases", []):
                 cv, ct = ci.get("value", ""), ci.get("task", {})
                 ck = ct.get("task_key", f"{key}_case_{cv}")
-                cases.append({"value": cv, "activities": build_activities([ck], visited.copy(), {ck: ct}, successors, nb_map, workspace_id, ignore | {key})})
+                cases.append({"value": cv, "activities": build_activities([ck], visited.copy(), {ck: ct}, successors, nb_map, workspace_id, ignore | {key}, run_id)})
             default_acts = []
             if task["switch_task"].get("default"):
                 dc = task["switch_task"]["default"]
                 dk = dc.get("task_key", f"{key}_default")
-                default_acts = build_activities([dk], visited.copy(), {dk: dc}, successors, nb_map, workspace_id, ignore | {key})
+                default_acts = build_activities([dk], visited.copy(), {dk: dc}, successors, nb_map, workspace_id, ignore | {key}, run_id)
+            logging.info(f"[RUN:{run_id}] Switch activity '{key}' built with {len(cases)} case(s)")
             acts.append({"name": key, "type": "Switch", "dependsOn": deps, "typeProperties": {"expression": {"value": f"@{switch_val}", "type": "Expression"}, "cases": cases, "defaultActivities": default_acts}})
-            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore)
+            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore, run_id)
 
         else:
-            logging.warning(f"Unsupported task type for '{key}' — skipping")
-            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore)
+            logging.warning(f"[RUN:{run_id}] Unsupported task type for '{key}' — skipping")
+            acts += build_activities([s for s, _ in successors.get(key, [])], visited, task_dict, successors, nb_map, workspace_id, ignore, run_id)
 
     return acts
 
@@ -373,32 +392,47 @@ def migrate_jobs(
     token = refresh_token()
     results = {"created": [], "failed": [], "already_exist": []}
 
+    logging.info(f"Starting job migration for {len(job_ids)} job(s): {job_ids}")
+
     for job_id in job_ids:
         run_id = str(uuid.uuid4())
+        logging.info(f"[RUN:{run_id}] Starting migration for job ID: {job_id}")
         try:
             job_settings = get_job(db_url, pat, job_id)
             job_name = job_settings.get("name", f"Job_{job_id}")
+            logging.info(f"[RUN:{run_id}] Job name: '{job_name}', tasks: {len(job_settings.get('tasks', []))}")
 
             # Migrate notebooks
             all_nbs = set()
             collect_notebooks(job_settings.get("tasks", []), all_nbs)
+            logging.info(f"[RUN:{run_id}] Found {len(all_nbs)} notebook(s) to migrate: {list(all_nbs)}")
+
             nb_map = {}
             for path in all_nbs:
                 name = sanitize_name(path.split("/")[-1])
+                logging.info(f"[RUN:{run_id}] Checking notebook: {name} ({path})")
                 nb_id = get_existing_notebook_id(workspace_id, token, name)
                 if not nb_id:
                     try:
+                        logging.info(f"[RUN:{run_id}] Exporting notebook from Databricks: {path}")
                         content_b64 = base64.b64encode(export_notebook(db_url, pat, path)).decode()
-                        nb_id = create_fabric_notebook(workspace_id, token, name, content_b64, refresh_token)
+                        nb_id = create_fabric_notebook(workspace_id, token, name, content_b64, refresh_token, run_id)
                     except Exception as e:
+                        logging.error(f"[RUN:{run_id}] Failed to migrate notebook '{path}': {str(e)}", exc_info=True)
                         results["failed"].append({"job_id": job_id, "path": path, "error": str(e), "run_id": run_id})
                         continue
+                else:
+                    logging.info(f"[RUN:{run_id}] Notebook already exists in Fabric: {name} (ID: {nb_id})")
+
                 if not wait_until_ready(workspace_id, token, nb_id):
+                    logging.error(f"[RUN:{run_id}] Notebook not ready after timeout: {name}")
                     results["failed"].append({"job_id": job_id, "path": path, "error": "Notebook not ready", "run_id": run_id})
                     continue
                 nb_map[path] = nb_id
+                logging.info(f"[RUN:{run_id}] Notebook mapped: {path} → {nb_id}")
 
             # Build activities
+            logging.info(f"[RUN:{run_id}] Building pipeline activities...")
             task_dict = {t["task_key"]: t for t in job_settings.get("tasks", []) if "task_key" in t}
             successors = defaultdict(list)
             for t in task_dict.values():
@@ -407,9 +441,12 @@ def migrate_jobs(
                     successors[d["task_key"]].append((t["task_key"], outcome))
 
             roots = list(set(task_dict.keys()) - {tgt for deps in successors.values() for tgt, _ in deps})
-            activities = build_activities(roots, set(), task_dict, successors, nb_map, workspace_id)
+            logging.info(f"[RUN:{run_id}] Root tasks: {roots}")
+            activities = build_activities(roots, set(), task_dict, successors, nb_map, workspace_id, run_id=run_id)
+            logging.info(f"[RUN:{run_id}] Built {len(activities)} top-level activity(s)")
 
             if not activities:
+                logging.error(f"[RUN:{run_id}] No activities built for job '{job_name}'")
                 results["failed"].append({"job_id": job_id, "error": "No activities built", "run_id": run_id})
                 continue
 
@@ -417,26 +454,33 @@ def migrate_jobs(
             pipeline_name = sanitize_name(job_name)
             existing_pid = get_existing_pipeline_id(workspace_id, token, pipeline_name)
             if existing_pid:
+                logging.info(f"[RUN:{run_id}] Pipeline already exists: '{pipeline_name}' (ID: {existing_pid})")
                 results["already_exist"].append({"job_id": job_id, "name": job_name, "fabric_pipeline_id": existing_pid, "run_id": run_id})
                 continue
 
             # Create pipeline
+            logging.info(f"[RUN:{run_id}] Creating pipeline: '{pipeline_name}'")
             inner = {"properties": {"activities": activities, "parameters": extract_parameters(job_settings), "variables": {}, "annotations": [], "description": f"Migrated from Databricks job '{job_name}' (ID: {job_id})"}}
             payload = {
                 "displayName": pipeline_name, "type": "DataPipeline",
                 "description": f"Migrated Databricks job {job_id}",
                 "definition": {"parts": [{"path": "pipeline-content.json", "payloadType": "InlineBase64", "payload": base64.b64encode(json.dumps(inner).encode()).decode()}]}
             }
-            pid = create_fabric_pipeline(workspace_id, token, payload, refresh_token)
+            pid = create_fabric_pipeline(workspace_id, token, payload, refresh_token, run_id)
+            logging.info(f"[RUN:{run_id}] Job '{job_name}' migrated successfully → pipeline ID: {pid}")
             results["created"].append({"job_id": job_id, "name": job_name, "fabric_pipeline_id": pid, "run_id": run_id})
             time.sleep(3)
 
         except Exception as e:
+            logging.error(f"[RUN:{run_id}] Failed to migrate job '{job_id}': {str(e)}", exc_info=True)
             results["failed"].append({"job_id": job_id, "error": str(e), "run_id": run_id})
 
     created_cnt, exists_cnt, failed_cnt = len(results["created"]), len(results["already_exist"]), len(results["failed"])
+    overall = "success" if failed_cnt == 0 else "partial" if created_cnt + exists_cnt > 0 else "failed"
+    logging.info(f"Job migration complete — status: {overall}, created: {created_cnt}, already_exist: {exists_cnt}, failed: {failed_cnt}, total: {len(job_ids)}")
+
     return {
-        "status": "success" if failed_cnt == 0 else "partial" if created_cnt + exists_cnt > 0 else "failed",
+        "status": overall,
         "created": created_cnt,
         "already_exist": exists_cnt,
         "failed": failed_cnt,

@@ -1,12 +1,17 @@
 import os
 import requests
+from pathlib import Path
+from dotenv import load_dotenv
 
-APP_INSIGHTS_APP_ID = os.environ.get("APP_INSIGHTS_APP_ID")
-APP_INSIGHTS_API_KEY = os.environ.get("APP_INSIGHTS_API_KEY")
+load_dotenv(Path(__file__).parent.parent / ".env")
 
+# ← remove the two module-level lines
 
 def get_logs(run_id: str) -> dict:
-    if not APP_INSIGHTS_APP_ID or not APP_INSIGHTS_API_KEY:
+    app_id = os.environ.get("APP_INSIGHTS_APP_ID")    # reads env fresh each call
+    api_key = os.environ.get("APP_INSIGHTS_API_KEY")  # reads env fresh each call
+    
+    if not app_id or not api_key:
         raise ValueError("Application Insights not configured")
 
     query = f"""
@@ -19,8 +24,8 @@ def get_logs(run_id: str) -> dict:
     """
 
     response = requests.get(
-        f"https://api.applicationinsights.io/v1/apps/{APP_INSIGHTS_APP_ID}/query",
-        headers={"x-api-key": APP_INSIGHTS_API_KEY, "Content-Type": "application/json"},
+        f"https://api.applicationinsights.io/v1/apps/{app_id}/query",
+        headers={"x-api-key": api_key, "Content-Type": "application/json"},
         params={"query": query},
         timeout=45
     )

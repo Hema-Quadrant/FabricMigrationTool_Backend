@@ -1,9 +1,17 @@
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Any, Optional
-
 import requests
+
+from logging_config import setup_logging
+setup_logging()
 
 from services.connect_databricks import list_workspace, list_jobs, list_clusters, get_workspace_name
 from services.get_logs import get_logs
@@ -149,7 +157,6 @@ def route_migrate_jobs(body: MigrateJobsRequest):
             workspace_id=body.workspaceId, db_url=body.databricksUrl, pat=body.personalAccessToken,
             job_ids=job_ids
         )
-        # result["created"], result["already_exist"], result["failed"] are all ints from migrate_jobs
         status_code = 200 if result["failed"] == 0 else 207 if result["created"] + result["already_exist"] > 0 else 500
         return JSONResponse(status_code=status_code, content=result)
     except Exception as e:
