@@ -3,3 +3,5 @@ uvicorn
 requests
 nbformat
 pydantic
+python-dotenv
+azure-monitor-opentelemetry
